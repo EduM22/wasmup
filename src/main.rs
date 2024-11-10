@@ -1,32 +1,146 @@
-use anyhow::Result;
-use wasmtime::*;
+use anyhow::bail;
+use hyper::server::conn::http1;
+use std::sync::Arc;
+use tokio::net::TcpListener;
+use wasmtime::component::{Component, Linker, ResourceTable};
+use wasmtime::{Config, Engine, Result, Store};
+use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
+use wasmtime_wasi_http::bindings::ProxyPre;
+use wasmtime_wasi_http::bindings::http::types::Scheme;
+use wasmtime_wasi_http::body::HyperOutgoingBody;
+use wasmtime_wasi_http::io::TokioIo;
+use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
-fn main() -> Result<()> {
-    let engine = Engine::default();
-    let wat = r#"
-        (module
-            (import "host" "hello" (func $host_hello (param i32)))
+#[tokio::main]
+async fn main() -> Result<()> {
+    let component = std::env::args().nth(1).unwrap();
 
-            (func (export "hello")
-                i32.const 3
-                call $host_hello)
-        )
-    "#;
-    let module = Module::new(&engine, wat)?;
+    // Prepare the `Engine` for Wasmtime
+    let mut config = Config::new();
+    config.async_support(true);
+    let engine = Engine::new(&config)?;
 
-    // Create a `Linker` and define our host function in it:
+    // Compile the component on the command line to machine code
+    let component = Component::from_file(&engine, &component)?;
+
+    // Prepare the `ProxyPre` which is a pre-instantiated version of the
+    // component that we have. This will make per-request instantiation
+    // much quicker.
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "hello", |caller: Caller<'_, u32>, param: i32| {
-        println!("Got {} from WebAssembly", param);
-        println!("my host state is: {}", caller.data());
-    })?;
+    wasmtime_wasi_http::add_to_linker_async(&mut linker)?;
+    let pre = ProxyPre::new(linker.instantiate_pre(&component)?)?;
 
-    // Use the `linker` to instantiate the module, which will automatically
-    // resolve the imports of the module using name-based resolution.
-    let mut store = Store::new(&engine, 0);
-    let instance = linker.instantiate(&mut store, &module)?;
-    let hello = instance.get_typed_func::<(), ()>(&mut store, "hello")?;
-    hello.call(&mut store, ())?;
+    // Prepare our server state and start listening for connections.
+    let server = Arc::new(MyServer { pre });
+    let listener = TcpListener::bind("127.0.0.1:8000").await?;
+    println!("Listening on {}", listener.local_addr()?);
 
-    Ok(())
+    loop {
+        // Accept a TCP connection and serve all of its requests in a separate
+        // tokio task. Note that for now this only works with HTTP/1.1.
+        let (client, addr) = listener.accept().await?;
+        println!("serving new client from {addr}");
+
+        let server = server.clone();
+        tokio::task::spawn(async move {
+            if let Err(e) = http1::Builder::new()
+                .keep_alive(true)
+                .serve_connection(
+                    TokioIo::new(client),
+                    hyper::service::service_fn(move |req| {
+                        let server = server.clone();
+                        async move { server.handle_request(req).await }
+                    }),
+                )
+                .await
+            {
+                eprintln!("error serving client[{addr}]: {e:?}");
+            }
+        });
+    }
+}
+
+struct MyServer {
+    pre: ProxyPre<MyClientState>,
+}
+
+impl MyServer {
+    async fn handle_request(
+        &self,
+        req: hyper::Request<hyper::body::Incoming>,
+    ) -> Result<hyper::Response<HyperOutgoingBody>> {
+        // Create per-http-request state within a `Store` and prepare the
+        // initial resources  passed to the `handle` function.
+        let mut store = Store::new(
+            self.pre.engine(),
+            MyClientState {
+                table: ResourceTable::new(),
+                wasi: WasiCtxBuilder::new().inherit_stdio().build(),
+                http: WasiHttpCtx::new(),
+            },
+        );
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let req = store.data_mut().new_incoming_request(Scheme::Http, req)?;
+        let out = store.data_mut().new_response_outparam(sender)?;
+        let pre = self.pre.clone();
+
+        // Run the http request itself in a separate task so the task can
+        // optionally continue to execute beyond after the initial
+        // headers/response code are sent.
+        let task = tokio::task::spawn(async move {
+            let proxy = pre.instantiate_async(&mut store).await?;
+
+            if let Err(e) = proxy
+                .wasi_http_incoming_handler()
+                .call_handle(store, req, out)
+                .await
+            {
+                return Err(e);
+            }
+
+            Ok(())
+        });
+
+        match receiver.await {
+            // If the client calls `response-outparam::set` then one of these
+            // methods will be called.
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(e)) => Err(e.into()),
+
+            // Otherwise the `sender` will get dropped along with the `Store`
+            // meaning that the oneshot will get disconnected and here we can
+            // inspect the `task` result to see what happened
+            Err(_) => {
+                let e = match task.await {
+                    Ok(r) => r.unwrap_err(),
+                    Err(e) => e.into(),
+                };
+                bail!("guest never invoked `response-outparam::set` method: {e:?}")
+            }
+        }
+    }
+}
+
+struct MyClientState {
+    wasi: WasiCtx,
+    http: WasiHttpCtx,
+    table: ResourceTable,
+}
+
+impl WasiView for MyClientState {
+    fn ctx(&mut self) -> &mut WasiCtx {
+        &mut self.wasi
+    }
+    fn table(&mut self) -> &mut ResourceTable {
+        &mut self.table
+    }
+}
+
+impl WasiHttpView for MyClientState {
+    fn ctx(&mut self) -> &mut WasiHttpCtx {
+        &mut self.http
+    }
+    fn table(&mut self) -> &mut ResourceTable {
+        &mut self.table
+    }
 }
